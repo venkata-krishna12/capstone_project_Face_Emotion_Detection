@@ -1,0 +1,55 @@
+body {
+  text-align: center;
+  font-family: "Poppins", sans-serif;
+  background: #f7f8fc;
+  color: #333;
+}
+
+h1 {
+  margin-top: 20px;
+}
+
+.buttons {
+  margin: 15px;
+}
+
+button {
+  margin: 5px;
+  padding: 10px 20px;
+  border: none;
+  background-color: #4caf50;
+  color: white;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+button:hover {
+  background-color: #45a049;
+}
+
+input[type="file"] {
+  margin: 10px;
+}
+
+.container {
+  position: relative;
+  display: inline-block;
+}
+
+#video, #image, #overlay {
+  border-radius: 10px;
+  box-shadow: 0 0 10px rgba(0,0,0,0.2);
+}
+
+#overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+#emotionResult {
+  margin-top: 20px;
+  font-size: 20px;
+  color: #007bff;
+}
