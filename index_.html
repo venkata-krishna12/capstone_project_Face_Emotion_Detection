@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Face Emotion Detection — Robust (fallback) | Local Models</title>
+  <style>
+    body{font-family:system-ui,Arial;background:#f3f6fb;color:#0b2545;margin:0;padding:20px;display:flex;justify-content:center}
+    .wrap{width:100%;max-width:1100px}
+    h1{text-align:center;margin:6px 0 12px}
+    .controls{display:flex;gap:10px;justify-content:center;margin-bottom:12px;flex-wrap:wrap}
+    button,input[type=file]{padding:10px 14px;border-radius:8px;border:0;cursor:pointer}
+    #start{background:#16a34a;color:#fff} #stop{background:#ef4444;color:#fff}
+    #status{ text-align:center;margin-bottom:10px;font-weight:600;color:#1e40af }
+    .stage{background:#fff;border-radius:10px;padding:12px;box-shadow:0 6px 20px rgba(0,0,0,0.06)}
+    .media-row{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+    .media-wrap{position:relative;width:640px;max-width:100%}
+    video, img { display:block; width:100%; height:auto; border-radius:8px; background:#000 }
+    canvas#overlay{ position:absolute; left:0; top:0; pointer-events:none; border-radius:8px; }
+    #note{font-size:13px;color:#334155;text-align:center;margin-top:8px}
+    #log{font-family:monospace;font-size:12px;color:#334155;white-space:pre-wrap;margin-top:8px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Face Emotion Detection — Robust Fallback (Local models)</h1>
+
+    <div class="controls">
+      <button id="start">Open Live Camera</button>
+      <button id="stop" disabled>Stop Camera</button>
+      <input id="file" type="file" accept="image/*">
+    </div>
+
+    <div id="status">Loading local models...</div>
+
+    <div class="stage">
+      <div class="media-row" style="justify-content:center;">
+        <div class="media-wrap">
+          <video id="video" autoplay muted playsinline style="display:none;"></video>
+          <img id="uploaded" alt="uploaded preview" style="display:none;" />
+          <canvas id="overlay"></canvas>
+        </div>
+      </div>
+
+      <div id="note">Make sure <code>./models</code> contains the model files: tiny_face_detector, face_expression, face_landmark_68 (manifest + shard files).</div>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <!-- face-api.js -->
+  <script src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+
+  <script>
+  (async ()=> {
+    // ================= CONFIG =================
+    const MODEL_URL = './models';   // local models folder
+    // ordered detector options: fast first, fallback to more accurate
+    const DETECTOR_OPTIONS = [
+      { inputSize: 128, scoreThreshold: 0.5 }, // fast
+      { inputSize: 224, scoreThreshold: 0.35 } // slower but more robust
+    ];
+    const VIDEO_FRAME_INTERVAL_MS = 150; // detection interval for live camera
+    // ==========================================
+
+    // DOM
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    const fileInput = document.getElementById('file');
+    const statusEl = document.getElementById('status');
+    const video = document.getElementById('video');
+    const uploaded = document.getElementById('uploaded');
+    const canvas = document.getElementById('overlay');
+    const logEl = document.getElementById('log');
+    const ctx = canvas.getContext('2d');
+
+    // state
+    let stream = null;
+    let rafId = null;
+    let videoTickTimer = null;
+
+    // small logger (prepend timestamp)
+    function log(msg){
+      const ts = new Date().toLocaleTimeString();
+      logEl.textContent = `[${ts}] ${msg}\n` + logEl.textContent;
+      console.log(msg);
+    }
+
+    // load exactly the nets we need (including landmarks)
+    try {
+      statusEl.textContent = 'Loading models (local)...';
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+        faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL)
+      ]);
+      statusEl.textContent = '✅ Models loaded (local). Ready.';
+      log('Models loaded from ' + MODEL_URL);
+    } catch (e) {
+      console.error('Model load error', e);
+      statusEl.textContent = '❌ Failed to load models from ./models — check console & files';
+      log('Model load failed: ' + (e && e.message ? e.message : e));
+      startBtn.disabled = true;
+      fileInput.disabled = true;
+      return;
+    }
+
+    // helper to resize canvas to match media element pixel size
+    function sizeOverlayTo(el){
+      const w = el.videoWidth || el.naturalWidth || el.width || 640;
+      const h = el.videoHeight || el.naturalHeight || el.height || 480;
+      canvas.width = Math.round(w);
+      canvas.height = Math.round(h);
+      // keep CSS size equal to the element's displayed size
+      canvas.style.width = el.clientWidth + 'px';
+      canvas.style.height = el.clientHeight + 'px';
+    }
+
+    // draw bounding boxes, labels and landmarks (resized detections)
+    function drawDetections(resizedDetections){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.textBaseline = 'top';
+      ctx.font = Math.max(14, Math.round(canvas.width / 40)) + 'px sans-serif';
+      if (!resizedDetections || resizedDetections.length === 0) return;
+      resizedDetections.forEach(det => {
+        const box = det.detection.box;
+        // rectangle
+        ctx.lineWidth = Math.max(2, Math.round(canvas.width / 300));
+        ctx.strokeStyle = '#00b7ff';
+        ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+        // label (top of box)
+        const exps = det.expressions || {};
+        const sorted = Object.entries(exps).sort((a,b)=>b[1]-a[1]);
+        const [best, prob] = sorted[0] || ['unknown', 0];
+        const label = `${best} ${(prob*100).toFixed(1)}%`;
+        const pad = 6;
+        const textW = ctx.measureText(label).width;
+        const labelX = Math.max(0, box.x);
+        const labelY = Math.max(0, box.y - (Math.round(canvas.height/25) + 6));
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(labelX - 2, labelY - 2, textW + pad, Math.round(canvas.height/25) + 6);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, labelX + 2, labelY + 1);
+
+        // landmarks
+        if (det.landmarks && det.landmarks.positions){
+          ctx.fillStyle = '#ffdd57';
+          const r = Math.max(1.2, Math.round(canvas.width / 400));
+          det.landmarks.positions.forEach(p => {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+            ctx.fill();
+          });
+        }
+      });
+    }
+
+    // DETECTION WITH FALLBACK:
+    // Try multiple TinyFaceDetectorOptions in order until we find >=1 detections.
+    // Returns raw faceapi detections (not yet resized).
+    async function detectWithFallback(mediaElement){
+      let detections = [];
+      for (let opt of DETECTOR_OPTIONS){
+        try {
+          const options = new faceapi.TinyFaceDetectorOptions(opt);
+          // request landmarks & expressions as well
+          detections = await faceapi.detectAllFaces(mediaElement, options).withFaceLandmarks().withFaceExpressions();
+          log(`Tried inputSize=${opt.inputSize}, scoreThreshold=${opt.scoreThreshold} -> ${detections.length} detections`);
+          if (detections && detections.length > 0) break;
+        } catch (err) {
+          console.error('Detection error with opt', opt, err);
+          log('Detection error with opt ' + JSON.stringify(opt) + ': ' + (err.message || err));
+        }
+      }
+      return detections; // empty array if none
+    }
+
+    // process uploaded image with fallback
+    async function processUpload(file){
+      if (!file) return;
+      // stop live if running
+      stopLive();
+
+      const img = await faceapi.bufferToImage(file);
+      uploaded.src = img.src;
+      uploaded.style.display = 'block';
+      video.style.display = 'none';
+
+      await new Promise(res => uploaded.onload = res);
+
+      sizeOverlayTo(uploaded);
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+
+      statusEl.textContent = 'Detecting (image)...';
+      const results = await detectWithFallback(uploaded);
+      // convert to canvas coordinates
+      faceapi.matchDimensions(canvas, { width: uploaded.naturalWidth, height: uploaded.naturalHeight });
+      const resized = faceapi.resizeResults(results, { width: canvas.width, height: canvas.height });
+
+      drawDetections(resized);
+      if (resized.length === 0) {
+        statusEl.textContent = 'No face detected (tried multiple settings). Try a clearer/frontal face.';
+        log('No faces found in uploaded image with all fallbacks.');
+      } else {
+        statusEl.textContent = 'Image processed';
+        log(`Image detections: ${resized.length}`);
+      }
+      fileInput.value = '';
+    }
+
+    // video detection loop (uses fallback per frame - acceptable given our small list)
+    async function detectVideoFrame(){
+      if (!video || video.readyState !== 4) return;
+      // we use fallback detection (will try fast first, then accurate if needed)
+      const results = await detectWithFallback(video);
+      // ensure overlay sized to video pixels
+      sizeOverlayTo(video);
+      faceapi.matchDimensions(canvas, { width: video.videoWidth, height: video.videoHeight });
+      const resized = faceapi.resizeResults(results, { width: canvas.width, height: canvas.height });
+      drawDetections(resized);
+    }
+
+    // start live camera
+    async function startLive(){
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        video.srcObject = stream;
+        video.style.display = 'block';
+        uploaded.style.display = 'none';
+        await video.play();
+
+        // size overlay and begin periodic detection using setInterval (keeps CPU reasonable)
+        sizeOverlayTo(video);
+        if (videoTickTimer) clearInterval(videoTickTimer);
+        videoTickTimer = setInterval(detectVideoFrame, VIDEO_FRAME_INTERVAL_MS);
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        fileInput.disabled = true;
+        statusEl.textContent = 'Camera on — detecting...';
+        log('Live camera started');
+      } catch (err) {
+        console.error('startLive error', err);
+        statusEl.textContent = 'Camera access failed — allow permission or try another browser';
+        log('Camera start failed: ' + (err.message || err));
+      }
+    }
+
+    // stop live
+    function stopLive(){
+      if (videoTickTimer) { clearInterval(videoTickTimer); videoTickTimer = null; }
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (video) { video.pause(); video.srcObject = null; video.style.display = 'none'; }
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      fileInput.disabled = false;
+      statusEl.textContent = 'Camera stopped';
+      log('Live camera stopped');
+    }
+
+    // UI handlers
+    startBtn.addEventListener('click', startLive);
+    stopBtn.addEventListener('click', stopLive);
+    fileInput.addEventListener('change', e => {
+      const f = e.target.files && e.target.files[0];
+      if (f) processUpload(f);
+    });
+
+    // cleanup on unload
+    window.addEventListener('beforeunload', () => {
+      stopLive();
+    });
+
+  })();
+  </script>
+</body>
+</html>
